@@ -1,0 +1,41 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "tsx watch src",
+    "migrate:dev": "npx drizzle-kit migrate dev",
+    "migrate": "npx drizzle-kit migrate",
+    "generate": "npx drizzle-kit generate"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "drizzle-orm": "^0.44.7",
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.16.3",
+    "postgres": "^3.4.7",
+    "process": "^0.11.10",
+    "socket.io": "^4.8.1",
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.4",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^24.9.1",
+    "@types/pg": "^8.15.5",
+    "drizzle-kit": "^0.31.5",
+    "nodemon": "^3.1.10",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
