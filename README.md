@@ -23,5 +23,7 @@ zod walidacja
 Baza Danych
 PostgreSQL
 
+web rtc do komunikacji real time
+
 Przechowywanie plików
 AWS S3

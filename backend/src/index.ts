@@ -4,7 +4,7 @@ import { createServer } from "http";
 import { Server } from "socket.io";
 import cors from "cors";
 import { db } from "./db/index";
-import { messages, users } from "./db/schema";
+import { messages, users, channels } from "./db/schema";
 import { eq, desc } from "drizzle-orm";
 import * as z from "zod";
 
@@ -33,23 +33,84 @@ const JoinChannelDataSchema = z.object({
   channelId: z.uuid(),
 });
 
+// Voice chat schema
+const VoiceCallSchema = z.object({
+  channelId: z.string().uuid(),
+  userId: z.string().uuid(),
+});
+
+// Voice chat participants and sockets
+const voiceParticipants = new Map<string, Set<string>>(); // channelId -> Set of userIds
+const userSocketMap = new Map<string, string>(); // userId -> socketId
+const chatParticiopants = new Map<string, Set<string>>();
+
+// Check channel type
+async function getChannelType(
+  channelId: string
+): Promise<"TEXT" | "VOICE"> {
+  const channel = await db.query.channels.findFirst({
+    where: eq(channels.id, channelId),
+    columns: { type: true },
+  });
+
+  if (!channel) {
+    throw new Error("Channel not found");
+  }
+
+  return channel.type;
+}
+
+function getUserIdFromScocket(socket: any): string | null {
+  const userId = socket.data?.userId;
+  return userId;
+}
+
 // Socket.io event handlers
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
+  socket.join("error");
+
+  // User authentication
+  socket.on("authenticate", (data: { userId: string }) => {
+    userSocketMap.set(data.userId, socket.id);
+    console.log(
+      `User authenticated: ${data.userId} -> ${socket.id}`
+    );
+  });
 
   // Join a specific channel
-  socket.on("join_channel", (data: unknown) => {
-    const parsedData = JoinChannelDataSchema.parse(data);
+  socket.on("join_channel", async (data: unknown) => {
+    try {
+      const parsedData = JoinChannelDataSchema.parse(data);
+      const _ = await getChannelType(parsedData.channelId);
 
-    socket.join(`channel_${parsedData.channelId}`);
-    console.log(
-      `User joined channel: ${parsedData.channelId}`
-    );
+      // if (channelType === "VOICE") {
+      //   // Create voice participants for channel
+      //   if (!voiceParticipants.has(parsedData.channelId)) {
+      //     voiceParticipants.set(
+      //       parsedData.channelId,
+      //       new Set()
+      //     );
+      //   }
+      //   const userId = getUserIdFromScocket(socket);
+      // } else {
+      // }
+      socket.join(`channel_${parsedData.channelId}`);
+      console.log(
+        `User joined channel: ${parsedData.channelId}`
+      );
+    } catch (error) {
+      console.error("Websocket Error join_channel", error);
+      if (error instanceof Error) {
+        socket.emit("error", error.message);
+      }
+    }
   });
 
   // Send message via WebSocket
   socket.on("send_message", async (data: unknown) => {
     try {
+      // TODO: take user id from auth method instaed of data
       const parsedData = SendMessageDataSchema.parse(data);
       // Save to database
       const [newMessage] = await db
@@ -74,18 +135,19 @@ io.on("connection", (socket) => {
 
       const messageWithUser = {
         ...newMessage,
+        // FIXME: don't let unauthenticated users send messages
         user: user || {
           id: parsedData.userId,
           username: "Unknown",
-          displayName: "Unknown User",
           avatarUrl: null,
         },
       };
 
+      console.log(messageWithUser);
       // Broadcast to everyone in the channel
       io.to(`channel_${parsedData.channelId}`).emit(
         "new_message",
-        messageWithUser
+        JSON.stringify(messageWithUser)
       );
     } catch (error) {
       console.error("WebSocket message error:", error);
@@ -156,56 +218,6 @@ app.get(
     }
   }
 );
-
-// Post a new message to a specific channel
-app.post("/api/messages", async (req, res) => {
-  try {
-    const { channelId, userId, content, imageUrl } =
-      req.body;
-
-    if (!channelId || !userId || !content?.trim()) {
-      return res
-        .status(400)
-        .json({ error: "Missing required fields" });
-    }
-
-    const [newMessage] = await db
-      .insert(messages)
-      .values({
-        channelId,
-        userId,
-        content: content.trim(),
-        imageUrl,
-      })
-      .returning();
-
-    const user = await db.query.users.findFirst({
-      where: eq(users.id, userId),
-      columns: {
-        id: true,
-        username: true,
-        avatarUrl: true,
-      },
-    });
-
-    const messageWithUser = {
-      ...newMessage,
-      user: user || {
-        id: userId,
-        username: "Unknown",
-        displayName: "Unknown User",
-        avatarUrl: null,
-      },
-    };
-
-    res.status(201).json(messageWithUser);
-  } catch (error) {
-    console.error("Error creating message:", error);
-    res
-      .status(500)
-      .json({ error: "Failed to create message" });
-  }
-});
 
 const PORT = process.env.PORT || 4000;
 
