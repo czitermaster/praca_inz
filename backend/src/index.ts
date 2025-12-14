@@ -5,8 +5,10 @@ import { Server } from "socket.io";
 import cors from "cors";
 import { db } from "./db/index";
 import { messages, users, channels } from "./db/schema";
-import { eq, desc } from "drizzle-orm";
+import { eq, asc, or } from "drizzle-orm";
 import * as z from "zod";
+import bcrypt from "bcryptjs";
+import { error } from "console";
 
 const app = express();
 const server = createServer(app);
@@ -37,6 +39,28 @@ const JoinChannelDataSchema = z.object({
 const VoiceCallSchema = z.object({
   channelId: z.string().uuid(),
   userId: z.string().uuid(),
+});
+
+const RegisterUserSchema = z.object({
+  username: z.string(),
+  email: z.string(),
+  password: z.regex(
+    /^(?=.*?[A-Z])(?=.*?[a-z])(?=.*?[0-9])(?=.*?[#?!@$%^&*-]).{8,}$/
+  ),
+  confirmPassword: z.string(),
+  avatarUrl: z.url().optional(),
+});
+
+const LoginUserSchema = z.object({
+  email: z.string(),
+  password: z.regex(
+    /^(?=.*?[A-Z])(?=.*?[a-z])(?=.*?[0-9])(?=.*?[#?!@$%^&*-]).{8,}$/
+  ),
+});
+
+const UpdateUserSchema = z.object({
+  username: z.string(),
+  avatarUrl: z.url().optional(),
 });
 
 // Voice chat participants and sockets
@@ -168,7 +192,7 @@ io.on("connection", (socket) => {
 // Middleware
 app.use(
   cors({
-    origin: "http://localhost:3000",
+    origin: "*",
     credentials: true,
   })
 );
@@ -206,7 +230,7 @@ app.get(
         .from(messages)
         .where(eq(messages.channelId, channelId))
         .leftJoin(users, eq(messages.userId, users.id))
-        .orderBy(desc(messages.createdAt))
+        .orderBy(asc(messages.createdAt))
         .limit(limit);
 
       res.json(channelMessages.reverse());
@@ -218,6 +242,74 @@ app.get(
     }
   }
 );
+
+app.post("/api/auth/register", async (req, res) => {
+  try {
+    const validatedData = RegisterUserSchema.parse(
+      req.body
+    );
+
+    if (
+      validatedData.confirmPassword !==
+      validatedData.password
+    ) {
+      return res
+        .status(400)
+        .json({ error: "Passwords do not match" });
+    }
+
+    const existingUsers = await db
+      .select()
+      .from(users)
+      .where(
+        or(
+          eq(users.username, validatedData.username),
+          eq(users.email, validatedData.email)
+        )
+      )
+      .limit(1);
+    if (existingUsers.length) {
+      const existingUser = existingUsers[0];
+      let errorMessage: string;
+      if (
+        existingUser.username === validatedData.username
+      ) {
+        errorMessage = `User with username: ${validatedData.username} already exists`;
+      } else {
+        errorMessage = `User with email: ${validatedData.email} already exists`;
+      }
+      return res.status(400).json({
+        error: errorMessage,
+      });
+    }
+    const hashedPassword = await bcrypt.hash(
+      validatedData.password,
+      10
+    );
+    const [newUser] = await db
+      .insert(users)
+      .values({
+        ...validatedData,
+        password: hashedPassword,
+      })
+      .returning({
+        id: users.id,
+        username: users.username,
+        email: users.email,
+        avatarUrl: users.avatarUrl,
+        createdAt: users.createdAt,
+      });
+    res.status(201).json({
+      user: newUser,
+      message: "Succesful registration",
+    });
+  } catch (error) {
+    console.error("Registration not possible", error);
+    res
+      .status(500)
+      .json({ error: "Internal server error" });
+  }
+});
 
 const PORT = process.env.PORT || 4000;
 
