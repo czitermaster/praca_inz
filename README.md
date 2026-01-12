@@ -16,7 +16,7 @@ Socket.io dla czatu głosowego i tekstowego
 
 drizzle ORM do bazy danych
 
-JWT do autentykacji
+JWT jose do autentykacji
 
 zod walidacja
 

@@ -5,10 +5,15 @@ import { Server } from "socket.io";
 import cors from "cors";
 import { db } from "./db/index";
 import { messages, users, channels } from "./db/schema";
-import { eq, asc, or } from "drizzle-orm";
+import { eq, asc } from "drizzle-orm";
 import * as z from "zod";
-import bcrypt from "bcryptjs";
-import { error } from "console";
+import {
+  registerHandler,
+  authMiddleware,
+  loginHandler,
+  getMeHandler,
+  verifyJWT,
+} from "./auth";
 
 const app = express();
 const server = createServer(app);
@@ -41,28 +46,6 @@ const VoiceCallSchema = z.object({
   userId: z.string().uuid(),
 });
 
-const RegisterUserSchema = z.object({
-  username: z.string(),
-  email: z.string(),
-  password: z.regex(
-    /^(?=.*?[A-Z])(?=.*?[a-z])(?=.*?[0-9])(?=.*?[#?!@$%^&*-]).{8,}$/
-  ),
-  confirmPassword: z.string(),
-  avatarUrl: z.url().optional(),
-});
-
-const LoginUserSchema = z.object({
-  email: z.string(),
-  password: z.regex(
-    /^(?=.*?[A-Z])(?=.*?[a-z])(?=.*?[0-9])(?=.*?[#?!@$%^&*-]).{8,}$/
-  ),
-});
-
-const UpdateUserSchema = z.object({
-  username: z.string(),
-  avatarUrl: z.url().optional(),
-});
-
 // Voice chat participants and sockets
 const voiceParticipants = new Map<string, Set<string>>(); // channelId -> Set of userIds
 const userSocketMap = new Map<string, string>(); // userId -> socketId
@@ -88,6 +71,27 @@ function getUserIdFromScocket(socket: any): string | null {
   const userId = socket.data?.userId;
   return userId;
 }
+
+const UNAUTHORIZED_SOCKET_ERR = new Error("UNAUTHORIZED");
+const INTERNAL_SERVER_ERR = new Error(
+  "INTERNAL SERVER ERROR"
+);
+
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth.token;
+
+    if (typeof token !== "string") {
+      return next(UNAUTHORIZED_SOCKET_ERR);
+    }
+    const user = await verifyJWT(token);
+
+    socket.data.user = user;
+    return next();
+  } catch (error) {
+    return next(INTERNAL_SERVER_ERR);
+  }
+});
 
 // Socket.io event handlers
 io.on("connection", (socket) => {
@@ -209,6 +213,7 @@ app.get("/api/health", (req, res) => {
 // Get messages for a specific channel
 app.get(
   "/api/channels/:channelId/messages",
+  authMiddleware,
   async (req, res) => {
     try {
       const { channelId } = req.params;
@@ -243,72 +248,14 @@ app.get(
   }
 );
 
-app.post("/api/auth/register", async (req, res) => {
-  try {
-    const validatedData = RegisterUserSchema.parse(
-      req.body
-    );
+app.post("/api/auth/register", registerHandler);
+app.post("/api/auth/login", loginHandler);
+app.get("/api/auth/me", authMiddleware, getMeHandler);
 
-    if (
-      validatedData.confirmPassword !==
-      validatedData.password
-    ) {
-      return res
-        .status(400)
-        .json({ error: "Passwords do not match" });
-    }
-
-    const existingUsers = await db
-      .select()
-      .from(users)
-      .where(
-        or(
-          eq(users.username, validatedData.username),
-          eq(users.email, validatedData.email)
-        )
-      )
-      .limit(1);
-    if (existingUsers.length) {
-      const existingUser = existingUsers[0];
-      let errorMessage: string;
-      if (
-        existingUser.username === validatedData.username
-      ) {
-        errorMessage = `User with username: ${validatedData.username} already exists`;
-      } else {
-        errorMessage = `User with email: ${validatedData.email} already exists`;
-      }
-      return res.status(400).json({
-        error: errorMessage,
-      });
-    }
-    const hashedPassword = await bcrypt.hash(
-      validatedData.password,
-      10
-    );
-    const [newUser] = await db
-      .insert(users)
-      .values({
-        ...validatedData,
-        password: hashedPassword,
-      })
-      .returning({
-        id: users.id,
-        username: users.username,
-        email: users.email,
-        avatarUrl: users.avatarUrl,
-        createdAt: users.createdAt,
-      });
-    res.status(201).json({
-      user: newUser,
-      message: "Succesful registration",
-    });
-  } catch (error) {
-    console.error("Registration not possible", error);
-    res
-      .status(500)
-      .json({ error: "Internal server error" });
-  }
+app.use((req, res) => {
+  res
+    .status(404)
+    .json({ error: "Not Found", path: req.originalUrl });
 });
 
 const PORT = process.env.PORT || 4000;

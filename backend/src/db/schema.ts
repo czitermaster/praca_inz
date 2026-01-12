@@ -25,6 +25,11 @@ export const users = pgTable("users", {
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
+export type UserSelect = Omit<
+  typeof users.$inferSelect,
+  "password"
+>;
+
 export const usersRelations = relations(
   users,
   ({ many }) => ({
