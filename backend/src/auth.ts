@@ -8,6 +8,7 @@ import bcrypt from "bcrypt";
 import { jwtVerify, SignJWT } from "jose";
 import { JwtPayload } from "jsonwebtoken";
 import { ref } from "process";
+import { UnauthorizedError, restHandler } from "./utils";
 
 const secret = new TextEncoder().encode(
   process.env.JWT_SECRET
@@ -222,30 +223,25 @@ export async function getMeHandler(
   }
 }
 
-export async function authMiddleware(
-  req: Request,
-  res: Response,
-  next: NextFunction
-) {
-  try {
-    const header = req.headers.authorization;
+export function authMiddleware() {
+  return restHandler(
+    async (
+      req: Request,
+      res: Response,
+      next: NextFunction
+    ) => {
+      const header = req.headers.authorization;
 
-    if (!header?.startsWith("Bearer ")) {
-      return res
-        .status(401)
-        .json({ error: "Unauthorized" });
+      if (!header?.startsWith("Bearer ")) {
+        throw new UnauthorizedError();
+      }
+
+      const token = header.split(" ")[1];
+
+      const user = await verifyJWT(token);
+
+      req.user = user;
+      next();
     }
-
-    const token = header.split(" ")[1];
-
-    const user = await verifyJWT(token);
-
-    req.user = user;
-    next();
-  } catch (error) {
-    console.error(`Auth middleware error: ${error}`);
-    return res
-      .status(500)
-      .json({ error: "Internal Server Error" });
-  }
+  );
 }

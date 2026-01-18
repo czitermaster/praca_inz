@@ -1,12 +1,12 @@
 import "dotenv/config";
 import express from "express";
 import { createServer } from "http";
-import { Server } from "socket.io";
-import cors from "cors";
-import { db } from "./db/index";
-import { messages, users, channels } from "./db/schema";
+import { Server, type DefaultEventsMap } from "socket.io";
 import { eq, asc } from "drizzle-orm";
+import cors from "cors";
 import * as z from "zod";
+import { db } from "./db/index";
+import { messages, users } from "./db/schema";
 import {
   registerHandler,
   authMiddleware,
@@ -14,11 +14,33 @@ import {
   getMeHandler,
   verifyJWT,
 } from "./auth";
+import {
+  socketHandler,
+  restHandler,
+  UnauthorizedSocketError,
+  NotFoundError,
+  errorHandler,
+  logger,
+  idGen,
+  type SocketData,
+} from "./utils";
+import {
+  createChannelHandler,
+  deleteChannelHandler,
+  getChannelType,
+  listChannelMessages,
+  updateChannelHandler,
+} from "./channels";
 
 const app = express();
 const server = createServer(app);
 
-const io = new Server(server, {
+const io = new Server<
+  DefaultEventsMap,
+  DefaultEventsMap,
+  DefaultEventsMap,
+  SocketData
+>(server, {
   cors: {
     origin: "*",
   },
@@ -36,227 +58,146 @@ const SendMessageDataSchema = z
     message: "Either content or imageUrl must be provided",
   });
 
-const JoinChannelDataSchema = z.object({
+const ChannelParticipationSchema = z.object({
   channelId: z.uuid(),
 });
 
-// Voice chat schema
-const VoiceCallSchema = z.object({
-  channelId: z.string().uuid(),
-  userId: z.string().uuid(),
-});
-
-// Voice chat participants and sockets
-const voiceParticipants = new Map<string, Set<string>>(); // channelId -> Set of userIds
-const userSocketMap = new Map<string, string>(); // userId -> socketId
-const chatParticiopants = new Map<string, Set<string>>();
-
-// Check channel type
-async function getChannelType(
-  channelId: string
-): Promise<"TEXT" | "VOICE"> {
-  const channel = await db.query.channels.findFirst({
-    where: eq(channels.id, channelId),
-    columns: { type: true },
-  });
-
-  if (!channel) {
-    throw new Error("Channel not found");
-  }
-
-  return channel.type;
-}
-
-function getUserIdFromScocket(socket: any): string | null {
-  const userId = socket.data?.userId;
-  return userId;
-}
-
-const UNAUTHORIZED_SOCKET_ERR = new Error("UNAUTHORIZED");
-const INTERNAL_SERVER_ERR = new Error(
-  "INTERNAL SERVER ERROR"
-);
-
 io.use(async (socket, next) => {
-  try {
-    const token = socket.handshake.auth.token;
+  const token = socket.handshake.query.token;
 
-    if (typeof token !== "string") {
-      return next(UNAUTHORIZED_SOCKET_ERR);
-    }
-    const user = await verifyJWT(token);
-
-    socket.data.user = user;
-    return next();
-  } catch (error) {
-    return next(INTERNAL_SERVER_ERR);
+  if (typeof token !== "string") {
+    return next(new UnauthorizedSocketError());
   }
+  const user = await verifyJWT(token);
+  socket.data.user = user;
+  return next();
 });
 
 // Socket.io event handlers
 io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
-  socket.join("error");
-
-  // User authentication
-  socket.on("authenticate", (data: { userId: string }) => {
-    userSocketMap.set(data.userId, socket.id);
-    console.log(
-      `User authenticated: ${data.userId} -> ${socket.id}`
-    );
-  });
-
   // Join a specific channel
-  socket.on("join_channel", async (data: unknown) => {
-    try {
-      const parsedData = JoinChannelDataSchema.parse(data);
+  socket.on(
+    "join_channel",
+    socketHandler(socket, async (data: unknown) => {
+      const parsedData =
+        ChannelParticipationSchema.parse(data);
       const _ = await getChannelType(parsedData.channelId);
-
-      // if (channelType === "VOICE") {
-      //   // Create voice participants for channel
-      //   if (!voiceParticipants.has(parsedData.channelId)) {
-      //     voiceParticipants.set(
-      //       parsedData.channelId,
-      //       new Set()
-      //     );
-      //   }
-      //   const userId = getUserIdFromScocket(socket);
-      // } else {
-      // }
       socket.join(`channel_${parsedData.channelId}`);
       console.log(
         `User joined channel: ${parsedData.channelId}`
       );
-    } catch (error) {
-      console.error("Websocket Error join_channel", error);
-      if (error instanceof Error) {
-        socket.emit("error", error.message);
-      }
-    }
-  });
+    })
+  );
+
+  socket.on(
+    "leave_channel",
+    socketHandler(socket, (data: unknown) => {
+      const parsedData =
+        ChannelParticipationSchema.parse(data);
+      socket.leave(`chanel_${parsedData.channelId}`);
+    })
+  );
 
   // Send message via WebSocket
-  socket.on("send_message", async (data: unknown) => {
-    try {
-      // TODO: take user id from auth method instaed of data
+  socket.on(
+    "send_message",
+    socketHandler(socket, async (data: unknown) => {
+      const user = socket.data.user;
+      if (!user) {
+        throw new UnauthorizedSocketError();
+      }
       const parsedData = SendMessageDataSchema.parse(data);
       // Save to database
       const [newMessage] = await db
         .insert(messages)
         .values({
           channelId: parsedData.channelId,
-          userId: parsedData.userId,
+          userId: user.id,
           content: parsedData.content?.trim(),
           imageUrl: parsedData.imageUrl,
         })
         .returning();
 
-      // Get user data
-      const user = await db.query.users.findFirst({
-        where: eq(users.id, parsedData.userId),
-        columns: {
-          id: true,
-          username: true,
-          avatarUrl: true,
-        },
-      });
-
       const messageWithUser = {
         ...newMessage,
-        // FIXME: don't let unauthenticated users send messages
-        user: user || {
-          id: parsedData.userId,
-          username: "Unknown",
-          avatarUrl: null,
-        },
+        user,
       };
 
-      console.log(messageWithUser);
-      // Broadcast to everyone in the channel
       io.to(`channel_${parsedData.channelId}`).emit(
         "new_message",
-        JSON.stringify(messageWithUser)
+        messageWithUser
       );
-    } catch (error) {
-      console.error("WebSocket message error:", error);
-      if (error instanceof z.ZodError) {
-        error.issues;
-      }
-      socket.emit("error", {
-        message: "Failed to send message",
-      });
-    }
-  });
+    })
+  );
 
   socket.on("disconnect", () => {
     console.log("User disconnected:", socket.id);
   });
 });
 
-// Middleware
 app.use(
   cors({
     origin: "*",
     credentials: true,
   })
 );
+
 app.use(express.json());
+app.use(idGen);
+app.use(logger);
 
-// Health check
-app.get("/api/health", (req, res) => {
-  res.json({
-    status: "OK",
-    message: "Server is running",
-  });
-});
-
-// Get messages for a specific channel
 app.get(
-  "/api/channels/:channelId/messages",
-  authMiddleware,
-  async (req, res) => {
-    try {
-      const { channelId } = req.params;
-      const limit =
-        parseInt(req.query.limit as string) || 50;
-
-      const channelMessages = await db
-        .select({
-          id: messages.id,
-          content: messages.content,
-          imageUrl: messages.imageUrl,
-          createdAt: messages.createdAt,
-          user: {
-            id: users.id,
-            username: users.username,
-            avatarUrl: users.avatarUrl,
-          },
-        })
-        .from(messages)
-        .where(eq(messages.channelId, channelId))
-        .leftJoin(users, eq(messages.userId, users.id))
-        .orderBy(asc(messages.createdAt))
-        .limit(limit);
-
-      res.json(channelMessages.reverse());
-    } catch (error) {
-      console.error("Error fetching messages:", error);
-      res
-        .status(500)
-        .json({ error: "Failed to fetch messages" });
-    }
-  }
+  "/api/health",
+  restHandler((req, res) => {
+    res.json({
+      status: "OK",
+      message: "Server is running",
+    });
+  })
 );
 
-app.post("/api/auth/register", registerHandler);
-app.post("/api/auth/login", loginHandler);
-app.get("/api/auth/me", authMiddleware, getMeHandler);
+app.get(
+  "/api/channels/:channelId/messages",
+  authMiddleware(),
+  restHandler(listChannelMessages)
+);
 
-app.use((req, res) => {
-  res
-    .status(404)
-    .json({ error: "Not Found", path: req.originalUrl });
-});
+app.post(
+  "/api/channels",
+  authMiddleware(),
+  restHandler(createChannelHandler)
+);
+
+app.delete(
+  "/api/channels/:channelId",
+  authMiddleware(),
+  restHandler(deleteChannelHandler)
+);
+
+app.put(
+  "/api/channels/:channelId",
+  authMiddleware(),
+  restHandler(updateChannelHandler)
+);
+
+app.post(
+  "/api/auth/register",
+  restHandler(registerHandler)
+);
+app.post("/api/auth/login", restHandler(loginHandler));
+app.get(
+  "/api/auth/me",
+  authMiddleware(),
+  restHandler(getMeHandler)
+);
+
+app.use(
+  restHandler((req, res) => {
+    throw new NotFoundError();
+  })
+);
+
+app.use(errorHandler);
 
 const PORT = process.env.PORT || 4000;
 
