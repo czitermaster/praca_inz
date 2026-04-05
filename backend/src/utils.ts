@@ -81,12 +81,24 @@ export class BadRequest extends AppError {
   code = 400;
   issues: z.core.$ZodIssue[] = [];
 
-  constructor(zodError?: z.ZodError) {
+  constructor(args?: {
+    message?: string;
+    issues?: z.core.$ZodIssue[];
+    cause?: Error;
+  }) {
     super({
-      message: zodError?.message ?? "Bad Request",
+      message: args?.message ?? "Bad Request",
+      cause: args?.cause,
+    });
+    this.issues = args?.issues ?? [];
+  }
+
+  static fromZodError(zodError: z.ZodError) {
+    return new BadRequest({
+      message: zodError.message,
+      issues: zodError.issues,
       cause: zodError,
     });
-    this.issues = zodError?.issues ?? [];
   }
 
   json() {
@@ -136,7 +148,7 @@ export function errorHandler(
   if (err instanceof AppError) {
     finalError = err;
   } else if (err instanceof z.ZodError) {
-    const badRequest = new BadRequest(err);
+    const badRequest = BadRequest.fromZodError(err);
     finalError = badRequest;
   } else {
     const internal = new InternalServerError({

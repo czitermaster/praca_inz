@@ -12,11 +12,13 @@
   "dependencies": {
     "@tanstack/react-query": "^5.90.12",
     "axios": "^1.12.2",
+    "cn-utility": "^1.0.1",
     "lucide-react": "^0.548.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "react-router-dom": "^7.9.4",
-    "socket.io-client": "^4.8.1"
+    "socket.io-client": "^4.8.1",
+    "zod": "^4.3.5"
   },
   "devDependencies": {
     "@eslint/js": "^9.36.0",

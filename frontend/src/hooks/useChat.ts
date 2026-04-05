@@ -1,7 +1,10 @@
 import { useEffect, useState } from "react";
-import { socket } from "../lib/socket";
-import { useQuery } from "@tanstack/react-query";
-import { qc } from "../main";
+import { getSocket } from "../lib/socket";
+import {
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { apiFetch } from "../api/http";
 
 export type ChatMessage = {
   id: string;
@@ -14,75 +17,71 @@ export type ChatMessage = {
     avatarUrl: string | null;
   };
 };
-// GET message
-const fetchMessages = async (
-  channelId: string
-): Promise<ChatMessage[]> => {
-  const response = await fetch(
-    `http://localhost:4000/api/channels/${channelId}/messages`
-  );
-  if (!response.ok) {
-    throw new Error("Could not retrieve messages");
-  }
-  return response.json();
-};
 
 export function useChat(userId: string, channelId: string) {
   const [connected, setConnected] = useState(false);
+  const qc = useQueryClient();
 
-  const { data: messages } = useQuery({
+  const { data: messages = [] } = useQuery<ChatMessage[]>({
     queryKey: ["messages", channelId],
-    queryFn: () => fetchMessages(channelId),
+    queryFn: () =>
+      apiFetch<ChatMessage[]>(
+        `/channels/${channelId}/messages`,
+      ),
     initialData: [],
   });
 
   useEffect(() => {
-    socket.connect();
+    const socket = getSocket();
+    if (!socket.connected) socket.connect();
 
-    socket.on("connect", () => {
+    function onConnect() {
       setConnected(true);
-      console.log("connected");
-      socket.emit("authenticate", { userId });
       socket.emit("join_channel", { channelId });
-    });
-
-    socket.on("new_message", (raw: string) => {
-      const message: ChatMessage = JSON.parse(raw);
+    }
+    function onDisconnect() {
+      setConnected(false);
+    }
+    function onNewMessage(message: ChatMessage) {
       qc.setQueryData<ChatMessage[]>(
         ["messages", channelId],
-        (oldMessages = []) => {
-          const messageExists = oldMessages.some(
-            (msg) => msg.id === message.id
-          );
-          if (messageExists) return oldMessages;
-          return [message, ...oldMessages];
-        }
+        (old = []) => {
+          if (old.some((m) => m.id === message.id))
+            return old;
+          return [message, ...old];
+        },
       );
-    });
+    }
 
-    socket.on("error", (err) => {
-      console.error("Socket error:", err);
-    });
+    socket.on("connect", onConnect);
+    socket.on("disconnect", onDisconnect);
+    socket.on("new_message", onNewMessage);
+    socket.on("error", console.error);
+
+    if (socket.connected) {
+      setConnected(true);
+      socket.emit("join_channel", { channelId });
+    }
 
     return () => {
-      socket.off("new_message");
-      socket.disconnect();
+      socket.emit("leave_channel", { channelId });
+      socket.off("connect", onConnect);
+      socket.off("disconnect", onDisconnect);
+      socket.off("new_message", onNewMessage);
+      socket.off("error", console.error);
     };
-  }, [userId, channelId]);
+  }, [userId, channelId, qc]);
 
-  const sendMessage = (content: string) => {
-    if (!content.trim()) return;
-
+  // imageUrl is optional — used when sending a file attachment
+  function sendMessage(content: string, imageUrl?: string) {
+    if (!content.trim() && !imageUrl) return;
+    const socket = getSocket();
     socket.emit("send_message", {
-      userId,
       channelId,
-      content,
+      ...(content.trim() ? { content } : {}),
+      ...(imageUrl ? { imageUrl } : {}),
     });
-  };
+  }
 
-  return {
-    messages,
-    sendMessage,
-    connected,
-  };
+  return { messages, sendMessage, connected };
 }

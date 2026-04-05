@@ -8,7 +8,11 @@ import bcrypt from "bcrypt";
 import { jwtVerify, SignJWT } from "jose";
 import { JwtPayload } from "jsonwebtoken";
 import { ref } from "process";
-import { UnauthorizedError, restHandler } from "./utils";
+import {
+  UnauthorizedError,
+  BadRequest,
+  restHandler,
+} from "./utils";
 
 const secret = new TextEncoder().encode(
   process.env.JWT_SECRET
@@ -22,7 +26,7 @@ export type JWTUser = Pick<
 async function singJWT(
   user: JWTUser,
   type: "refresh" | "access"
-): Promise<String> {
+): Promise<string> {
   return await new SignJWT({ user })
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
@@ -63,80 +67,63 @@ export async function registerHandler(
   req: Request,
   res: Response
 ) {
-  try {
-    const validatedData = RegisterUserSchema.parse(
-      req.body
-    );
+  const validatedData = RegisterUserSchema.parse(req.body);
 
-    if (
-      validatedData.confirmPassword !==
-      validatedData.password
-    ) {
-      return res
-        .status(400)
-        .json({ error: "Passwords do not match" });
-    }
-
-    const existingUsers = await db
-      .select()
-      .from(users)
-      .where(
-        or(
-          eq(users.username, validatedData.username),
-          eq(users.email, validatedData.email)
-        )
-      )
-      .limit(1);
-    if (existingUsers.length) {
-      const existingUser = existingUsers[0];
-      let errorMessage: string;
-      if (
-        existingUser.username === validatedData.username
-      ) {
-        errorMessage = `User with username: ${validatedData.username} already exists`;
-      } else {
-        errorMessage = `User with email: ${validatedData.email} already exists`;
-      }
-      return res.status(400).json({
-        error: errorMessage,
-      });
-    }
-    const hashedPassword = await bcrypt.hash(
-      validatedData.password,
-      10
-    );
-    const [newUser] = await db
-      .insert(users)
-      .values({
-        ...validatedData,
-        password: hashedPassword,
-      })
-      .returning({
-        id: users.id,
-        username: users.username,
-        email: users.email,
-        avatarUrl: users.avatarUrl,
-        createdAt: users.createdAt,
-      });
-
-    const jwtUser: JWTUser = {
-      ...newUser,
-    };
-
-    const accessToken = await singJWT(jwtUser, "access");
-
-    res.status(201).json({
-      accessToken,
+  if (
+    validatedData.confirmPassword !== validatedData.password
+  ) {
+    throw new BadRequest({
+      message: "Passwords do not match",
     });
-  } catch (error) {
-    console.error("Registration not possible", error);
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({ error: error.issues });
-    }
-    res
-      .status(500)
-      .json({ error: "Internal server error" });
   }
+
+  const existingUsers = await db
+    .select()
+    .from(users)
+    .where(
+      or(
+        eq(users.username, validatedData.username),
+        eq(users.email, validatedData.email)
+      )
+    )
+    .limit(1);
+  if (existingUsers.length) {
+    const existingUser = existingUsers[0];
+    let errorMessage: string;
+    if (existingUser.username === validatedData.username) {
+      errorMessage = `User with username: ${validatedData.username} already exists`;
+    } else {
+      errorMessage = `User with email: ${validatedData.email} already exists`;
+    }
+    throw new BadRequest({ message: errorMessage });
+  }
+  const hashedPassword = await bcrypt.hash(
+    validatedData.password,
+    10
+  );
+  const [newUser] = await db
+    .insert(users)
+    .values({
+      ...validatedData,
+      password: hashedPassword,
+    })
+    .returning({
+      id: users.id,
+      username: users.username,
+      email: users.email,
+      avatarUrl: users.avatarUrl,
+      createdAt: users.createdAt,
+    });
+
+  const jwtUser: JWTUser = {
+    ...newUser,
+  };
+
+  const accessToken = await singJWT(jwtUser, "access");
+
+  res.status(201).json({
+    accessToken,
+  });
 }
 
 const LoginSchema = z.object({
@@ -148,79 +135,57 @@ export async function loginHandler(
   req: Request,
   res: Response
 ) {
-  try {
-    const data = LoginSchema.parse(req.body);
+  const data = LoginSchema.parse(req.body);
 
-    // Find user by email
-    const user = await db.query.users.findFirst({
-      where: eq(users.email, data.email),
-      columns: {
-        id: true,
-        username: true,
-        email: true,
-        password: true,
-        avatarUrl: true,
-      },
-    });
+  // Find user by email
+  const user = await db.query.users.findFirst({
+    where: eq(users.email, data.email),
+    columns: {
+      id: true,
+      username: true,
+      email: true,
+      password: true,
+      avatarUrl: true,
+    },
+  });
 
-    if (!user) {
-      return res
-        .status(401)
-        .json({ error: "Invalid email or password" });
-    }
-
-    const isValid = await bcrypt.compare(
-      data.password,
-      user.password
-    );
-
-    if (!isValid) {
-      return res
-        .status(401)
-        .json({ error: "Invalid email or password" });
-    }
-
-    const jwtUser: JWTUser = {
-      id: user.id,
-      username: user.username,
-      email: user.email,
-      avatarUrl: user.avatarUrl,
-    };
-
-    const accessToken = await singJWT(jwtUser, "access");
-
-    return res.json({
-      accessToken,
-    });
-  } catch (err) {
-    console.error("loginHandler error:", err);
-    if (err instanceof z.ZodError) {
-      return res.status(400).json({ error: err.issues });
-    }
-    return res
-      .status(500)
-      .json({ error: "Internal server error" });
+  if (!user) {
+    throw new UnauthorizedError();
   }
+
+  const isValid = await bcrypt.compare(
+    data.password,
+    user.password
+  );
+
+  if (!isValid) {
+    throw new UnauthorizedError();
+  }
+
+  const jwtUser: JWTUser = {
+    id: user.id,
+    username: user.username,
+    email: user.email,
+    avatarUrl: user.avatarUrl,
+  };
+
+  const accessToken = await singJWT(jwtUser, "access");
+
+  return res.json({
+    accessToken,
+  });
 }
 
 export async function getMeHandler(
   req: Request,
   res: Response
 ) {
-  try {
-    const user = req.user;
+  const user = req.user;
 
-    if (!user) {
-      return res
-        .status(401)
-        .json({ error: "Unauthorized" });
-    }
-    return res.json({ user });
-  } catch (err) {
-    return res
-      .status(500)
-      .json({ error: "Internal server error" });
+  if (!user) {
+    throw new UnauthorizedError();
   }
+  return res.json({ user });
 }
 
 export function authMiddleware() {

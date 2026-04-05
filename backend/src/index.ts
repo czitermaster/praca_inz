@@ -2,17 +2,18 @@ import "dotenv/config";
 import express from "express";
 import { createServer } from "http";
 import { Server, type DefaultEventsMap } from "socket.io";
-import { eq, asc } from "drizzle-orm";
 import cors from "cors";
 import * as z from "zod";
+import path from "path";
 import { db } from "./db/index";
-import { messages, users } from "./db/schema";
+import { messages } from "./db/schema";
 import {
   registerHandler,
   authMiddleware,
   loginHandler,
   getMeHandler,
   verifyJWT,
+  type JWTUser,
 } from "./auth";
 import {
   socketHandler,
@@ -30,7 +31,9 @@ import {
   getChannelType,
   listChannelMessages,
   updateChannelHandler,
+  listChannelsHandler,
 } from "./channels";
+import { upload, uploadHandler } from "../src/upload";
 
 const app = express();
 const server = createServer(app);
@@ -41,20 +44,21 @@ const io = new Server<
   DefaultEventsMap,
   SocketData
 >(server, {
-  cors: {
-    origin: "*",
-  },
+  cors: { origin: "*" },
 });
 
-// Validation schema
+// ─── Voice room state ──────────────────────────────────────────────────────────
+const voiceRooms = new Map<string, Set<string>>();
+const socketUsers = new Map<string, JWTUser>();
+
+// ─── Schemas ──────────────────────────────────────────────────────────────────
 const SendMessageDataSchema = z
   .object({
     channelId: z.uuid(),
-    userId: z.uuid(),
     content: z.string().optional(),
     imageUrl: z.url().optional(),
   })
-  .refine((data) => data.content || data.imageUrl, {
+  .refine((d) => d.content || d.imageUrl, {
     message: "Either content or imageUrl must be provided",
   });
 
@@ -62,146 +66,250 @@ const ChannelParticipationSchema = z.object({
   channelId: z.uuid(),
 });
 
+const VoiceSignalSchema = z.object({
+  targetSocketId: z.string(),
+  channelId: z.uuid(),
+  payload: z.unknown(),
+});
+
+// ─── Socket auth ──────────────────────────────────────────────────────────────
 io.use(async (socket, next) => {
   const token = socket.handshake.query.token;
-
-  if (typeof token !== "string") {
+  if (typeof token !== "string")
     return next(new UnauthorizedSocketError());
-  }
   const user = await verifyJWT(token);
   socket.data.user = user;
   return next();
 });
 
-// Socket.io event handlers
+// ─── Socket events ────────────────────────────────────────────────────────────
 io.on("connection", (socket) => {
-  // Join a specific channel
+  const user = socket.data.user;
+  if (user) socketUsers.set(socket.id, user);
+
   socket.on(
     "join_channel",
     socketHandler(socket, async (data: unknown) => {
-      const parsedData =
+      const { channelId } =
         ChannelParticipationSchema.parse(data);
-      const _ = await getChannelType(parsedData.channelId);
-      socket.join(`channel_${parsedData.channelId}`);
-      console.log(
-        `User joined channel: ${parsedData.channelId}`
-      );
-    })
+      await getChannelType(channelId);
+      socket.join(`channel_${channelId}`);
+    }),
   );
 
   socket.on(
     "leave_channel",
     socketHandler(socket, (data: unknown) => {
-      const parsedData =
+      const { channelId } =
         ChannelParticipationSchema.parse(data);
-      socket.leave(`chanel_${parsedData.channelId}`);
-    })
+      socket.leave(`channel_${channelId}`);
+    }),
   );
 
-  // Send message via WebSocket
   socket.on(
     "send_message",
     socketHandler(socket, async (data: unknown) => {
-      const user = socket.data.user;
-      if (!user) {
-        throw new UnauthorizedSocketError();
-      }
-      const parsedData = SendMessageDataSchema.parse(data);
-      // Save to database
+      if (!user) throw new UnauthorizedSocketError();
+      const parsed = SendMessageDataSchema.parse(data);
       const [newMessage] = await db
         .insert(messages)
         .values({
-          channelId: parsedData.channelId,
+          channelId: parsed.channelId,
           userId: user.id,
-          content: parsedData.content?.trim(),
-          imageUrl: parsedData.imageUrl,
+          content: parsed.content?.trim(),
+          imageUrl: parsed.imageUrl,
         })
         .returning();
-
-      const messageWithUser = {
-        ...newMessage,
-        user,
-      };
-
-      io.to(`channel_${parsedData.channelId}`).emit(
+      io.to(`channel_${parsed.channelId}`).emit(
         "new_message",
-        messageWithUser
+        { ...newMessage, user },
       );
-    })
+    }),
+  );
+
+  // Voice
+  socket.on(
+    "join_voice_channel",
+    socketHandler(socket, async (data: unknown) => {
+      if (!user) throw new UnauthorizedSocketError();
+      const { channelId } =
+        ChannelParticipationSchema.parse(data);
+      const type = await getChannelType(channelId);
+      if (type !== "VOICE")
+        throw new Error("Not a voice channel");
+      socket.join(`voice_${channelId}`);
+      if (!voiceRooms.has(channelId))
+        voiceRooms.set(channelId, new Set());
+      voiceRooms.get(channelId)!.add(socket.id);
+      const roomSocketIds = io.sockets.adapter.rooms.get(
+        `voice_${channelId}`,
+      );
+      const existingPeers = roomSocketIds
+        ? [...roomSocketIds]
+            .filter((id) => id !== socket.id)
+            .map((socketId) => ({
+              socketId,
+              user: socketUsers.get(socketId) ?? null,
+            }))
+            .filter((p) => p.user !== null)
+        : [];
+      socket.emit("voice_room_users", {
+        channelId,
+        peers: existingPeers,
+      });
+      socket
+        .to(`voice_${channelId}`)
+        .emit("voice_user_joined", {
+          channelId,
+          socketId: socket.id,
+          user,
+        });
+    }),
+  );
+
+  socket.on(
+    "leave_voice_channel",
+    socketHandler(socket, (data: unknown) => {
+      const { channelId } =
+        ChannelParticipationSchema.parse(data);
+      leaveVoiceChannel(socket.id, channelId);
+    }),
+  );
+
+  socket.on(
+    "voice_offer",
+    socketHandler(socket, (data: unknown) => {
+      const { targetSocketId, channelId, payload } =
+        VoiceSignalSchema.parse(data);
+      io.to(targetSocketId).emit("voice_offer", {
+        fromSocketId: socket.id,
+        channelId,
+        offer: payload,
+        user,
+      });
+    }),
+  );
+
+  socket.on(
+    "voice_answer",
+    socketHandler(socket, (data: unknown) => {
+      const { targetSocketId, channelId, payload } =
+        VoiceSignalSchema.parse(data);
+      io.to(targetSocketId).emit("voice_answer", {
+        fromSocketId: socket.id,
+        channelId,
+        answer: payload,
+      });
+    }),
+  );
+
+  socket.on(
+    "voice_ice_candidate",
+    socketHandler(socket, (data: unknown) => {
+      const { targetSocketId, channelId, payload } =
+        VoiceSignalSchema.parse(data);
+      io.to(targetSocketId).emit("voice_ice_candidate", {
+        fromSocketId: socket.id,
+        channelId,
+        candidate: payload,
+      });
+    }),
   );
 
   socket.on("disconnect", () => {
-    console.log("User disconnected:", socket.id);
+    for (const [
+      channelId,
+      members,
+    ] of voiceRooms.entries()) {
+      if (members.has(socket.id))
+        leaveVoiceChannel(socket.id, channelId);
+    }
+    socketUsers.delete(socket.id);
   });
+
+  function leaveVoiceChannel(
+    socketId: string,
+    channelId: string,
+  ) {
+    socket.leave(`voice_${channelId}`);
+    voiceRooms.get(channelId)?.delete(socketId);
+    io.to(`voice_${channelId}`).emit("voice_user_left", {
+      channelId,
+      socketId,
+    });
+  }
 });
 
-app.use(
-  cors({
-    origin: "*",
-    credentials: true,
-  })
-);
-
+// ─── REST ─────────────────────────────────────────────────────────────────────
+app.use(cors({ origin: "*", credentials: true }));
 app.use(express.json());
 app.use(idGen);
 app.use(logger);
 
-app.get(
-  "/api/health",
-  restHandler((req, res) => {
-    res.json({
-      status: "OK",
-      message: "Server is running",
-    });
-  })
+// Serve uploaded files as static
+app.use(
+  "/uploads",
+  express.static(path.join(process.cwd(), "uploads")),
 );
 
+app.get(
+  "/api/health",
+  restHandler((_req, res) => res.json({ status: "OK" })),
+);
+
+// File upload endpoint
+app.post(
+  "/api/upload",
+  authMiddleware(),
+  upload.single("file"),
+  restHandler(uploadHandler),
+);
+
+app.get(
+  "/api/channels",
+  authMiddleware(),
+  restHandler(listChannelsHandler),
+);
 app.get(
   "/api/channels/:channelId/messages",
   authMiddleware(),
-  restHandler(listChannelMessages)
+  restHandler(listChannelMessages),
 );
-
 app.post(
   "/api/channels",
   authMiddleware(),
-  restHandler(createChannelHandler)
+  restHandler(createChannelHandler),
 );
-
 app.delete(
   "/api/channels/:channelId",
   authMiddleware(),
-  restHandler(deleteChannelHandler)
+  restHandler(deleteChannelHandler),
 );
-
 app.put(
   "/api/channels/:channelId",
   authMiddleware(),
-  restHandler(updateChannelHandler)
+  restHandler(updateChannelHandler),
 );
 
 app.post(
   "/api/auth/register",
-  restHandler(registerHandler)
+  restHandler(registerHandler),
 );
 app.post("/api/auth/login", restHandler(loginHandler));
 app.get(
   "/api/auth/me",
   authMiddleware(),
-  restHandler(getMeHandler)
+  restHandler(getMeHandler),
 );
 
 app.use(
-  restHandler((req, res) => {
+  restHandler(() => {
     throw new NotFoundError();
-  })
+  }),
 );
-
 app.use(errorHandler);
 
 const PORT = process.env.PORT || 4000;
-
 server.listen(PORT, () => {
   console.log("Server running at http://localhost:" + PORT);
-  console.log("WebSocket ready at ws://localhost:" + PORT);
 });
